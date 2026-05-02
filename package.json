@@ -1,0 +1,38 @@
+{
+  "name": "proctor-client",
+  "version": "1.0.0",
+  "description": "AI Exam Proctor - JavaScript/Node.js Client for the Python Proctoring Service",
+  "main": "proctor_client.js",
+  "bin": {
+    "proctor": "proctor_client.js"
+  },
+  "scripts": {
+    "start": "node proctor_client.js start",
+    "stop": "node proctor_client.js stop",
+    "status": "node proctor_client.js status",
+    "stats": "node proctor_client.js stats",
+    "monitor": "node proctor_client.js monitor",
+    "screenshot": "node proctor_client.js screenshot",
+    "reset": "node proctor_client.js reset",
+    "help": "node proctor_client.js help"
+  },
+  "keywords": [
+    "proctoring",
+    "exam",
+    "ai",
+    "monitoring",
+    "api",
+    "websocket"
+  ],
+  "author": "Built with Claude (Anthropic)",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "chalk": "^4.1.2",
+    "socket.io-client": "^4.5.4",
+    "table": "^6.8.1"
+  },
+  "engines": {
+    "node": ">=12.0.0"
+  }
+}

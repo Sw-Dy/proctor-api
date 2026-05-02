@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proctor Client Example</title>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #333; margin-bottom: 30px; }
+        .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 30px; }
+        button { padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: all 0.3s; }
+        .btn-start { background: #4CAF50; color: white; }
+        .btn-start:hover { background: #45a049; transform: translateY(-2px); }
+        .btn-stop { background: #f44336; color: white; }
+        .btn-stop:hover { background: #da190b; transform: translateY(-2px); }
+        .btn-secondary { background: #2196F3; color: white; }
+        .btn-secondary:hover { background: #0b7dda; transform: translateY(-2px); }
+        .status-panel { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .status-row { display: grid; grid-template-columns: 150px 1fr; gap: 20px; padding: 10px; border-bottom: 1px solid #eee; }
+        .status-row:last-child { border-bottom: none; }
+        .status-label { font-weight: bold; color: #666; }
+        .status-value { color: #333; font-size: 16px; }
+        .violation-high { color: #f44336; font-weight: bold; }
+        .violation-medium { color: #ff9800; font-weight: bold; }
+        .violation-low { color: #4CAF50; font-weight: bold; }
+        .session-log { background: #f9f9f9; padding: 15px; border-radius: 6px; border-left: 4px solid #2196F3; margin-top: 20px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+        .log-entry { margin: 5px 0; color: #666; }
+        .log-success { color: #4CAF50; }
+        .log-error { color: #f44336; }
+        .log-info { color: #2196F3; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 20px; }
+        .stat-card { background: white; padding: 15px; border-radius: 6px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stat-card h3 { color: #666; font-size: 12px; text-transform: uppercase; margin-bottom: 10px; }
+        .stat-card .value { font-size: 28px; font-weight: bold; color: #333; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎓 AI Exam Proctor - Web Client Example</h1>
+        
+        <div class="controls">
+            <button class="btn-start" onclick="startSession()">START</button>
+            <button class="btn-stop" onclick="stopSession()">STOP</button>
+            <button class="btn-secondary" onclick="refreshStatus()">REFRESH</button>
+            <button class="btn-secondary" onclick="takeScreenshot()">📸</button>
+            <button class="btn-secondary" onclick="resetCounters()">RESET</button>
+            <button class="btn-secondary" onclick="getStats()">STATS</button>
+        </div>
+
+        <div class="status-panel" id="statusPanel">
+            <div class="status-row">
+                <div class="status-label">Status:</div>
+                <div class="status-value" id="statusValue">Checking...</div>
+            </div>
+            <div class="status-row">
+                <div class="status-label">Session ID:</div>
+                <div class="status-value" id="sessionIdValue">—</div>
+            </div>
+            <div class="status-row">
+                <div class="status-label">Uptime:</div>
+                <div class="status-value" id="uptimeValue">0s</div>
+            </div>
+            <div class="status-row">
+                <div class="status-label">Violations:</div>
+                <div class="status-value" id="violationsValue">0</div>
+            </div>
+            <div class="status-row">
+                <div class="status-label">Score:</div>
+                <div class="status-value" id="scoreValue">0.0/100</div>
+            </div>
+            <div class="status-row">
+                <div class="status-label">Face:</div>
+                <div class="status-value" id="faceValue">—</div>
+            </div>
+            <div class="status-row">
+                <div class="status-label">Gaze:</div>
+                <div class="status-value" id="gazeValue">—</div>
+            </div>
+            <div class="status-row">
+                <div class="status-label">Audio (RMS):</div>
+                <div class="status-value" id="audioValue">0</div>
+            </div>
+        </div>
+
+        <div class="stats-grid" id="statsGrid" style="display: none;">
+            <div class="stat-card">
+                <h3>Avg Score</h3>
+                <div class="value" id="statAvgScore">—</div>
+            </div>
+            <div class="stat-card">
+                <h3>Max Score</h3>
+                <div class="value" id="statMaxScore">—</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Blinks</h3>
+                <div class="value" id="statBlinks">—</div>
+            </div>
+            <div class="stat-card">
+                <h3>Frames</h3>
+                <div class="value" id="statFrames">—</div>
+            </div>
+        </div>
+
+        <div class="session-log" id="sessionLog"></div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:5000';
+        let statusInterval = null;
+
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const prefix = `[${timestamp}]`;
+            const logDiv = document.getElementById('sessionLog');
+            
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            entry.textContent = `${prefix} ${message}`;
+            
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        async function startSession() {
+            try {
+                log('Starting session...', 'info');
+                const response = await axios.post(`${API_URL}/api/start`);
+                log(`✓ Session started: ${response.data.session_id}`, 'success');
+                startStatusPolling();
+            } catch (error) {
+                log(`✗ Failed to start: ${error.message}`, 'error');
+            }
+        }
+
+        async function stopSession() {
+            try {
+                log('Stopping session...', 'info');
+                const response = await axios.post(`${API_URL}/api/stop`);
+                log('✓ Session stopped', 'success');
+                stopStatusPolling();
+                refreshStatus();
+            } catch (error) {
+                log(`✗ Failed to stop: ${error.message}`, 'error');
+            }
+        }
+
+        async function refreshStatus() {
+            try {
+                const response = await axios.get(`${API_URL}/api/status`);
+                const status = response.data;
+                
+                document.getElementById('statusValue').textContent = status.status?.toUpperCase() || 'UNKNOWN';
+                document.getElementById('sessionIdValue').textContent = status.session_id || '—';
+                document.getElementById('uptimeValue').textContent = formatSeconds(status.uptime_sec);
+                
+                const violationsElement = document.getElementById('violationsValue');
+                violationsElement.textContent = status.violations;
+                if (status.violations > 5) {
+                    violationsElement.className = 'status-value violation-high';
+                } else if (status.violations > 0) {
+                    violationsElement.className = 'status-value violation-medium';
+                } else {
+                    violationsElement.className = 'status-value violation-low';
+                }
+                
+                const scoreElement = document.getElementById('scoreValue');
+                scoreElement.textContent = `${status.suspicious_score.toFixed(1)}/100`;
+                if (status.suspicious_score > 60) {
+                    scoreElement.className = 'status-value violation-high';
+                } else if (status.suspicious_score > 25) {
+                    scoreElement.className = 'status-value violation-medium';
+                } else {
+                    scoreElement.className = 'status-value violation-low';
+                }
+                
+                document.getElementById('faceValue').textContent = status.face_detected ? '✓ Detected' : '✗ Not Detected';
+                document.getElementById('gazeValue').textContent = status.gaze_away ? '↗ Away' : '✓ Focused';
+                document.getElementById('audioValue').textContent = Math.round(status.audio_rms);
+                
+            } catch (error) {
+                log(`✗ Failed to refresh: ${error.message}`, 'error');
+            }
+        }
+
+        async function getStats() {
+            try {
+                log('Fetching statistics...', 'info');
+                const response = await axios.get(`${API_URL}/api/stats`);
+                const stats = response.data;
+                
+                document.getElementById('statAvgScore').textContent = stats.avg_score?.toFixed(1) || '—';
+                document.getElementById('statMaxScore').textContent = stats.max_score?.toFixed(1) || '—';
+                document.getElementById('statBlinks').textContent = stats.total_blinks || '—';
+                document.getElementById('statFrames').textContent = stats.frame_count || '—';
+                
+                document.getElementById('statsGrid').style.display = 'grid';
+                log('✓ Statistics updated', 'success');
+            } catch (error) {
+                log(`✗ Failed to get stats: ${error.message}`, 'error');
+            }
+        }
+
+        async function takeScreenshot() {
+            try {
+                log('Capturing screenshot...', 'info');
+                const response = await axios.post(`${API_URL}/api/action`, { action: 'screenshot' });
+                log(`✓ Screenshot saved: ${response.data.path}`, 'success');
+            } catch (error) {
+                log(`✗ Failed to capture: ${error.message}`, 'error');
+            }
+        }
+
+        async function resetCounters() {
+            try {
+                log('Resetting counters...', 'info');
+                await axios.post(`${API_URL}/api/action`, { action: 'reset' });
+                log('✓ Counters reset', 'success');
+                refreshStatus();
+            } catch (error) {
+                log(`✗ Failed to reset: ${error.message}`, 'error');
+            }
+        }
+
+        function startStatusPolling() {
+            if (statusInterval) clearInterval(statusInterval);
+            refreshStatus();
+            statusInterval = setInterval(refreshStatus, 2000);
+        }
+
+        function stopStatusPolling() {
+            if (statusInterval) {
+                clearInterval(statusInterval);
+                statusInterval = null;
+            }
+        }
+
+        function formatSeconds(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = Math.floor(seconds % 60);
+            
+            if (hours > 0) return `${hours}h ${minutes}m ${secs}s`;
+            if (minutes > 0) return `${minutes}m ${secs}s`;
+            return `${secs}s`;
+        }
+
+        // Initial load
+        log('Client loaded', 'info');
+        refreshStatus();
+    </script>
+</body>
+</html>
