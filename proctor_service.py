@@ -68,6 +68,9 @@ class ProctorServiceManager:
             "frame_count": 0,
             "violations": 0,
             "suspicious_score": 0.0,
+            "avg_score": 0.0,
+            "max_score": 0.0,
+            "total_blinks": 0,
             "face_detected": False,
             "gaze_away": False,
             "head_turned": False,
@@ -181,6 +184,9 @@ class ProctorServiceManager:
                         self._state["uptime_sec"] = elapsed
                         self._state["violations"] = self.proctor_system._total_violations
                         self._state["suspicious_score"] = self.proctor_system.detector.suspicious_score
+                        self._state["avg_score"] = round(self.proctor_system.detector.avg_score, 2)
+                        self._state["max_score"] = round(self.proctor_system.detector.max_score, 2)
+                        self._state["total_blinks"] = self.proctor_system.eye_tracker.blink_count
                         self._state["face_detected"] = face_data.detected
                         self._state["gaze_away"] = gaze_data.looking_away
                         self._state["head_turned"] = head_data.is_turned
@@ -261,18 +267,19 @@ class ProctorServiceManager:
         if not self.proctor_system:
             return {"error": "No session running"}
 
-        return {
-            "session_id": self.proctor_system.session_id,
-            "start_time": self._state["start_time"],
-            "uptime_sec": self._state["uptime_sec"],
-            "frame_count": self._state["frame_count"],
-            "total_violations": self._state["violations"],
-            "suspicious_score": self._state["suspicious_score"],
-            "avg_score": round(self.proctor_system.detector.avg_score, 2),
-            "max_score": round(self.proctor_system.detector.max_score, 2),
-            "total_blinks": self.proctor_system.eye_tracker.blink_count,
-            "violation_counts": self.proctor_system._violation_counts,
-        }
+        with self._state_lock:
+            return {
+                "session_id": self._state["session_id"],
+                "start_time": self._state["start_time"],
+                "uptime_sec": self._state["uptime_sec"],
+                "frame_count": self._state["frame_count"],
+                "total_violations": self._state["violations"],
+                "suspicious_score": self._state["suspicious_score"],
+                "avg_score": self._state["avg_score"],
+                "max_score": self._state["max_score"],
+                "total_blinks": self._state["total_blinks"],
+                "violation_counts": self.proctor_system._violation_counts,
+            }
 
 
 # Global service manager
@@ -940,7 +947,7 @@ if __name__ == '__main__':
     print("  AI EXAM PROCTORING SERVICE — Flask API")
     print("=" * 64)
     print()
-    print("  Dashboard: http://localhost:5000")
+    print("  Dashboard: http://localhost:8765")
     print()
     print("  REST API Endpoints:")
     print("    GET  /api/status    — Current status")
@@ -951,4 +958,4 @@ if __name__ == '__main__':
     print()
     print("=" * 64)
 
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    socketio.run(app, host='0.0.0.0', port=8765, debug=False)

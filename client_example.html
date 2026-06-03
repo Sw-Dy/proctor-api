@@ -108,8 +108,9 @@
     </div>
 
     <script>
-        const API_URL = 'http://localhost:5000';
+        const API_URL = 'http://localhost:8765';
         let statusInterval = null;
+        let statsInterval = null;
 
         function log(message, type = 'info') {
             const timestamp = new Date().toLocaleTimeString();
@@ -187,19 +188,25 @@
 
         async function getStats() {
             try {
-                log('Fetching statistics...', 'info');
                 const response = await axios.get(`${API_URL}/api/stats`);
                 const stats = response.data;
                 
-                document.getElementById('statAvgScore').textContent = stats.avg_score?.toFixed(1) || '—';
-                document.getElementById('statMaxScore').textContent = stats.max_score?.toFixed(1) || '—';
-                document.getElementById('statBlinks').textContent = stats.total_blinks || '—';
-                document.getElementById('statFrames').textContent = stats.frame_count || '—';
+                if (stats.error) {
+                    log(`✗ Stats error: ${stats.error}`, 'error');
+                    return;
+                }
+                
+                document.getElementById('statAvgScore').textContent = stats.avg_score !== undefined ? stats.avg_score.toFixed(1) : '—';
+                document.getElementById('statMaxScore').textContent = stats.max_score !== undefined ? stats.max_score.toFixed(1) : '—';
+                document.getElementById('statBlinks').textContent = stats.total_blinks !== undefined ? stats.total_blinks : '—';
+                document.getElementById('statFrames').textContent = stats.frame_count !== undefined ? stats.frame_count : '—';
                 
                 document.getElementById('statsGrid').style.display = 'grid';
-                log('✓ Statistics updated', 'success');
             } catch (error) {
-                log(`✗ Failed to get stats: ${error.message}`, 'error');
+                // Silently ignore errors during auto-refresh to reduce log noise
+                if (error.response?.status !== 400) {
+                    // Only log non-session-errors
+                }
             }
         }
 
@@ -226,14 +233,21 @@
 
         function startStatusPolling() {
             if (statusInterval) clearInterval(statusInterval);
+            if (statsInterval) clearInterval(statsInterval);
             refreshStatus();
+            getStats(); // Fetch stats immediately
             statusInterval = setInterval(refreshStatus, 2000);
+            statsInterval = setInterval(getStats, 3000); // Auto-refresh stats every 3 seconds
         }
 
         function stopStatusPolling() {
             if (statusInterval) {
                 clearInterval(statusInterval);
                 statusInterval = null;
+            }
+            if (statsInterval) {
+                clearInterval(statsInterval);
+                statsInterval = null;
             }
         }
 

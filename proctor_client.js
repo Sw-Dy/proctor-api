@@ -32,7 +32,7 @@ const io = require('socket.io-client');
 // CONFIGURATION
 // ─────────────────────────────────────────────────────────────────
 
-const API_BASE_URL = process.env.PROCTOR_API || 'http://localhost:5000';
+const API_BASE_URL = process.env.PROCTOR_API || 'http://localhost:8765';
 const API_CONFIG = {
     baseURL: API_BASE_URL,
     timeout: 10000,
@@ -99,7 +99,7 @@ ${chalk.bold('Commands:')}
 
 ${chalk.bold('Environment Variables:')}
 
-  PROCTOR_API     API server URL (default: http://localhost:5000)
+  PROCTOR_API     API server URL (default: http://localhost:8765)
   DEBUG           Enable debug logging (set to 1)
 
 ${chalk.bold('Examples:')}
@@ -112,7 +112,7 @@ ${chalk.bold('Examples:')}
   node proctor_client.js status
 
   # Connect to remote server
-  PROCTOR_API=http://192.168.1.100:5000 node proctor_client.js stats
+  PROCTOR_API=http://192.168.1.100:8765 node proctor_client.js stats
 
 ${chalk.bold('Requirements:')}
 

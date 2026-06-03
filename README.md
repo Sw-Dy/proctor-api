@@ -45,7 +45,7 @@ node proctor_client.js start
 - **`proctor_client.js`** - JavaScript CLI client (new)
 
 ### Web Interfaces
-- **Embedded Dashboard** at `http://localhost:5000` (automatic)
+- **Embedded Dashboard** at `http://localhost:8765` (automatic)
 - **HTML Example** at `client_example.html` (standalone)
 
 ### Documentation
@@ -60,7 +60,7 @@ node proctor_client.js start
 
 ### 1️⃣ Web Dashboard (Easiest)
 ```
-http://localhost:5000
+http://localhost:8765
 ```
 - Beautiful responsive UI
 - Real-time metrics
@@ -79,9 +79,9 @@ node proctor_client.js stats
 
 ### 3️⃣ REST API (Flexible)
 ```bash
-curl -X POST http://localhost:5000/api/start
-curl http://localhost:5000/api/status
-curl -X POST http://localhost:5000/api/stop
+curl -X POST http://localhost:8765/api/start
+curl http://localhost:8765/api/status
+curl -X POST http://localhost:8765/api/stop
 ```
 - Pure HTTP/WebSocket
 - Language agnostic
@@ -104,16 +104,16 @@ curl -X POST http://localhost:5000/api/stop
 **Example:**
 ```bash
 # Start
-curl -X POST http://localhost:5000/api/start
+curl -X POST http://localhost:8765/api/start
 
 # Check status
-curl http://localhost:5000/api/status
+curl http://localhost:8765/api/status
 
 # Get stats
-curl http://localhost:5000/api/stats
+curl http://localhost:8765/api/stats
 
 # Stop
-curl -X POST http://localhost:5000/api/stop
+curl -X POST http://localhost:8765/api/stop
 ```
 
 ---
@@ -136,7 +136,7 @@ Real-time dashboard shows violations, scores, face detection, etc.
 python proctor_service.py
 
 # Browser
-http://localhost:5000
+http://localhost:8765
 ```
 Click START, watch the dashboard, click STOP.
 
@@ -145,16 +145,16 @@ Click START, watch the dashboard, click STOP.
 const axios = require('axios');
 
 // Start session
-await axios.post('http://localhost:5000/api/start');
+await axios.post('http://localhost:8765/api/start');
 
 // Monitor for 5 minutes
 setTimeout(async () => {
-  const stats = await axios.get('http://localhost:5000/api/stats');
+  const stats = await axios.get('http://localhost:8765/api/stats');
   console.log('Violations:', stats.data.total_violations);
 }, 5 * 60 * 1000);
 
 // Stop and collect results
-await axios.post('http://localhost:5000/api/stop');
+await axios.post('http://localhost:8765/api/stop');
 ```
 
 ---
@@ -183,13 +183,13 @@ ProctorSystem (proctor.py - Background Thread)
 ```python
 import requests
 
-session = requests.post('http://localhost:5000/api/start').json()
+session = requests.post('http://localhost:8765/api/start').json()
 print(f"Session: {session['session_id']}")
 
-status = requests.get('http://localhost:5000/api/status').json()
+status = requests.get('http://localhost:8765/api/status').json()
 print(f"Violations: {status['violations']}")
 
-requests.post('http://localhost:5000/api/stop')
+requests.post('http://localhost:8765/api/stop')
 ```
 
 ### JavaScript
@@ -197,7 +197,7 @@ requests.post('http://localhost:5000/api/stop')
 const axios = require('axios');
 
 const api = axios.create({ 
-  baseURL: 'http://localhost:5000' 
+  baseURL: 'http://localhost:8765' 
 });
 
 await api.post('/api/start');
