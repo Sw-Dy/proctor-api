@@ -482,9 +482,6 @@ See `QUICKSTART.md` for more solutions.
 
 ---
 
-## 📝 License
-
-MIT - Built with Claude (Anthropic)
 
 ---
 
@@ -528,4 +525,4 @@ node proctor_client.js help
 
 ---
 
-**Ready to proctor? Your service is production-ready!** 🎓✅
+
