@@ -33,6 +33,9 @@ const io = require('socket.io-client');
 // ─────────────────────────────────────────────────────────────────
 
 const API_BASE_URL = process.env.PROCTOR_API || 'http://localhost:8765';
+const API_TOKEN = process.env.PROCTOR_TOKEN || '';
+const API_USERNAME = process.env.PROCTOR_USER || '';
+const API_PASSWORD = process.env.PROCTOR_PASSWORD || '';
 const API_CONFIG = {
     baseURL: API_BASE_URL,
     timeout: 10000,
@@ -95,11 +98,15 @@ ${chalk.bold('Commands:')}
   ${chalk.green('screenshot')}         Capture a screenshot
   ${chalk.green('reset')}              Reset violation counters
   ${chalk.green('monitor')}            Real-time monitoring dashboard
+  ${chalk.green('login')}              Get a JWT for a username/password
   ${chalk.green('help')}               Show this help message
 
 ${chalk.bold('Environment Variables:')}
 
   PROCTOR_API     API server URL (default: http://localhost:8765)
+  PROCTOR_TOKEN   JWT token returned by login
+  PROCTOR_USER    Username for automatic login
+  PROCTOR_PASSWORD Password for automatic login
   DEBUG           Enable debug logging (set to 1)
 
 ${chalk.bold('Examples:')}
@@ -109,7 +116,7 @@ ${chalk.bold('Examples:')}
   node proctor_client.js monitor
 
   # Get current status
-  node proctor_client.js status
+  PROCTOR_USER=user1 PROCTOR_PASSWORD=User1@123 node proctor_client.js status
 
   # Connect to remote server
   PROCTOR_API=http://192.168.1.100:8765 node proctor_client.js stats
@@ -129,10 +136,44 @@ class ProctorClient {
     constructor(baseURL) {
         this.client = axios.create({ ...API_CONFIG, baseURL });
         this.socket = null;
+        this.token = API_TOKEN;
+        if (this.token) {
+            this.setToken(this.token);
+        }
+    }
+
+    setToken(token) {
+        this.token = token;
+        this.client.defaults.headers.common.Authorization = `Bearer ${token}`;
+    }
+
+    async login(username, password) {
+        try {
+            const response = await this.client.post('/api/auth/login', { username, password });
+            if (response.data.error) {
+                throw new Error(response.data.error);
+            }
+            this.setToken(response.data.token);
+            log(`Logged in as ${response.data.user.username}`, 'success');
+            return response.data;
+        } catch (error) {
+            log(`Login failed: ${error.message}`, 'error');
+            throw error;
+        }
+    }
+
+    async ensureAuth() {
+        if (this.token) return;
+        if (API_USERNAME && API_PASSWORD) {
+            await this.login(API_USERNAME, API_PASSWORD);
+            return;
+        }
+        throw new Error('Authentication required. Set PROCTOR_TOKEN or PROCTOR_USER and PROCTOR_PASSWORD.');
     }
 
     async start() {
         try {
+            await this.ensureAuth();
             log('Starting proctoring session...', 'info');
             const response = await this.client.post('/api/start');
             if (response.data.error) {
@@ -148,6 +189,7 @@ class ProctorClient {
 
     async stop() {
         try {
+            await this.ensureAuth();
             log('Stopping proctoring session...', 'info');
             const response = await this.client.post('/api/stop');
             if (response.data.error) {
@@ -163,6 +205,7 @@ class ProctorClient {
 
     async getStatus() {
         try {
+            await this.ensureAuth();
             const response = await this.client.get('/api/status');
             return response.data;
         } catch (error) {
@@ -173,6 +216,7 @@ class ProctorClient {
 
     async getStats() {
         try {
+            await this.ensureAuth();
             const response = await this.client.get('/api/stats');
             if (response.data.error) {
                 throw new Error(response.data.error);
@@ -186,6 +230,7 @@ class ProctorClient {
 
     async performAction(action) {
         try {
+            await this.ensureAuth();
             const response = await this.client.post('/api/action', { action });
             if (response.data.error) {
                 throw new Error(response.data.error);
@@ -199,6 +244,7 @@ class ProctorClient {
 
     async getConfig() {
         try {
+            await this.ensureAuth();
             const response = await this.client.get('/api/config');
             return response.data;
         } catch (error) {
@@ -211,6 +257,7 @@ class ProctorClient {
         return new Promise((resolve, reject) => {
             try {
                 this.socket = io(API_BASE_URL, {
+                    auth: { token: this.token },
                     reconnection: true,
                     reconnectionDelay: 1000,
                     reconnectionDelayMax: 5000,
@@ -351,7 +398,9 @@ async function monitorSession(client) {
     printHeader('REAL-TIME MONITORING');
     
     try {
+        await client.ensureAuth();
         await client.connectWebSocket();
+        client.socket.emit('request_state', { token: client.token });
         
         log('Monitoring session... Press Ctrl+C to exit', 'info');
         console.log();
@@ -398,6 +447,20 @@ async function main() {
 
     try {
         switch (command.toLowerCase()) {
+            case 'login':
+                printHeader('LOGIN');
+                const username = process.argv[3] || API_USERNAME;
+                const password = process.argv[4] || API_PASSWORD;
+                if (!username || !password) {
+                    throw new Error('Usage: node proctor_client.js login <username> <password>');
+                }
+                const login = await client.login(username, password);
+                console.log();
+                console.log(chalk.bold('Token:'));
+                console.log(login.token);
+                console.log();
+                break;
+
             case 'start':
                 printHeader('START SESSION');
                 await client.start();

@@ -771,6 +771,8 @@ class Logger:
         self.session_id = session_id
         self._events: List[ViolationEvent] = []
         self._lock = threading.Lock()
+        self.event_callback = None
+        self.screenshot_callback = None
         self._log_dir = CONFIG["LOG_DIR"]
         self._ss_dir  = CONFIG["SCREENSHOT_DIR"]
         os.makedirs(self._log_dir, exist_ok=True)
@@ -790,6 +792,11 @@ class Logger:
     def log(self, event: ViolationEvent):
         with self._lock:
             self._events.append(event)
+        if self.event_callback:
+            try:
+                self.event_callback(event)
+            except Exception as e:
+                print(f"[Logger] Event callback failed: {e}")
         if CONFIG["LOG_FORMAT"] in ("csv", "both"):
             with open(self._csv_path, "a", newline="") as f:
                 w = csv.writer(f)
@@ -801,6 +808,11 @@ class Logger:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(self._ss_dir, f"{vtype}_{ts}.jpg")
         cv2.imwrite(path, frame)
+        if self.screenshot_callback:
+            try:
+                self.screenshot_callback(path, vtype)
+            except Exception as e:
+                print(f"[Logger] Screenshot callback failed: {e}")
         return path
 
     def finalize(self, stats: SessionStats):

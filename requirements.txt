@@ -7,3 +7,5 @@ mediapipe
 numpy
 pyaudio
 python-engineio
+PyJWT
+psycopg2-binary

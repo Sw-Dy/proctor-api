@@ -26,10 +26,16 @@ import threading
 import time
 import queue
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
 from flask import Flask, jsonify, request, render_template_string
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+from werkzeug.security import check_password_hash, generate_password_hash
+import jwt
+import psycopg2
+from psycopg2.extras import DictCursor, Json
+from dotenv import load_dotenv
 
 # Import the original proctor system
 import sys
@@ -45,9 +51,297 @@ from proctor import (
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'proctor-secret-key-change-in-production'
+app.config['SECRET_KEY'] = os.environ.get('JWT_SECRET', 'proctor-secret-key-change-in-production')
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
+JWT_ALGORITHM = "HS256"
+
+load_dotenv()
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/protraq"
+)
+
+JWT_EXP_HOURS = int(os.environ.get("JWT_EXP_HOURS", "8"))
+
+print("Current dir:", os.getcwd())
+print("ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
+print("Using DATABASE_URL:", DATABASE_URL) 
+
+DEFAULT_USERS = (
+    ("user1", "User1@123", "User 1"),
+    ("user2", "User2@123", "User 2"),
+    ("user3", "User3@123", "User 3"),
+)
+
+
+class Database:
+    """Small Postgres gateway for users and per-user proctor metrics."""
+
+    def __init__(self, database_url: str):
+        self.database_url = database_url
+        self.available = False
+
+    def connect(self):
+        return psycopg2.connect(self.database_url, cursor_factory=DictCursor)
+
+    def initialize(self):
+        try:
+            with self.connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            id SERIAL PRIMARY KEY,
+                            username TEXT UNIQUE NOT NULL,
+                            password_hash TEXT NOT NULL,
+                            display_name TEXT NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS proctor_sessions (
+                            id SERIAL PRIMARY KEY,
+                            session_id TEXT UNIQUE NOT NULL,
+                            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            status TEXT NOT NULL DEFAULT 'running',
+                            start_time TIMESTAMPTZ,
+                            end_time TIMESTAMPTZ,
+                            uptime_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
+                            frame_count INTEGER NOT NULL DEFAULT 0,
+                            total_violations INTEGER NOT NULL DEFAULT 0,
+                            suspicious_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                            avg_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                            max_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                            total_blinks INTEGER NOT NULL DEFAULT 0,
+                            flags INTEGER NOT NULL DEFAULT 0,
+                            screenshot_count INTEGER NOT NULL DEFAULT 0,
+                            face_detected BOOLEAN NOT NULL DEFAULT FALSE,
+                            gaze_away BOOLEAN NOT NULL DEFAULT FALSE,
+                            gaze_focus BOOLEAN NOT NULL DEFAULT TRUE,
+                            head_turned BOOLEAN NOT NULL DEFAULT FALSE,
+                            mouth_open BOOLEAN NOT NULL DEFAULT FALSE,
+                            audio_rms DOUBLE PRECISION NOT NULL DEFAULT 0,
+                            violation_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS session_screenshots (
+                            id SERIAL PRIMARY KEY,
+                            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            session_id TEXT NOT NULL,
+                            path TEXT NOT NULL,
+                            reason TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS session_logs (
+                            id SERIAL PRIMARY KEY,
+                            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            session_id TEXT,
+                            event_type TEXT NOT NULL,
+                            message TEXT NOT NULL,
+                            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    for username, password, display_name in DEFAULT_USERS:
+                        cur.execute("""
+                            INSERT INTO users (username, password_hash, display_name)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (username) DO NOTHING;
+                        """, (username, generate_password_hash(password), display_name))
+            self.available = True
+            print("[Database] Postgres initialized.")
+        except Exception as e:
+            self.available = False
+            print(f"[Database] Postgres unavailable: {e}")
+
+    def get_user_by_username(self, username: str):
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE username = %s;", (username,))
+            return cur.fetchone()
+
+    def get_user_by_id(self, user_id: int):
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, username, display_name FROM users WHERE id = %s;", (user_id,))
+            return cur.fetchone()
+
+    def create_session(self, user, session_id: str, start_time: str):
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO proctor_sessions (session_id, user_id, status, start_time)
+                VALUES (%s, %s, 'running', %s)
+                ON CONFLICT (session_id) DO UPDATE
+                    SET user_id = EXCLUDED.user_id,
+                        status = 'running',
+                        start_time = EXCLUDED.start_time,
+                        end_time = NULL,
+                        updated_at = NOW();
+            """, (session_id, user["id"], start_time))
+
+    def update_session(self, user_id: int, state: dict, status: str = None, end_time: str = None):
+        if not state.get("session_id"):
+            return
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE proctor_sessions
+                   SET status = COALESCE(%s, status),
+                       end_time = COALESCE(%s, end_time),
+                       uptime_sec = %s,
+                       frame_count = %s,
+                       total_violations = %s,
+                       suspicious_score = %s,
+                       avg_score = %s,
+                       max_score = %s,
+                       total_blinks = %s,
+                       flags = %s,
+                       screenshot_count = %s,
+                       face_detected = %s,
+                       gaze_away = %s,
+                       gaze_focus = %s,
+                       head_turned = %s,
+                       mouth_open = %s,
+                       audio_rms = %s,
+                       violation_counts = %s,
+                       updated_at = NOW()
+                 WHERE session_id = %s AND user_id = %s;
+            """, (
+                status,
+                end_time,
+                state.get("uptime_sec", 0),
+                state.get("frame_count", 0),
+                state.get("violations", 0),
+                state.get("suspicious_score", 0),
+                state.get("avg_score", 0),
+                state.get("max_score", 0),
+                state.get("total_blinks", 0),
+                state.get("flags", state.get("violations", 0)),
+                state.get("screenshot_count", 0),
+                state.get("face_detected", False),
+                state.get("gaze_away", False),
+                state.get("gaze_focus", not state.get("gaze_away", False)),
+                state.get("head_turned", False),
+                state.get("mouth_open", False),
+                state.get("audio_rms", 0),
+                Json(state.get("violation_counts", {})),
+                state["session_id"],
+                user_id,
+            ))
+
+    def record_screenshot(self, user_id: int, session_id: str, path: str, reason: str):
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO session_screenshots (user_id, session_id, path, reason)
+                VALUES (%s, %s, %s, %s);
+            """, (user_id, session_id, path, reason))
+            cur.execute("""
+                UPDATE proctor_sessions
+                   SET screenshot_count = screenshot_count + 1,
+                       updated_at = NOW()
+                 WHERE session_id = %s AND user_id = %s;
+            """, (session_id, user_id))
+
+    def record_log(self, user_id: int, session_id: str, event_type: str, message: str, payload=None):
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO session_logs (user_id, session_id, event_type, message, payload)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (user_id, session_id, event_type, message, Json(payload or {})))
+
+    def get_user_summary(self, user_id: int):
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)::int AS session_count,
+                    COALESCE(SUM(total_violations), 0)::int AS total_violations,
+                    COALESCE(SUM(flags), 0)::int AS total_flags,
+                    COALESCE(SUM(screenshot_count), 0)::int AS total_screenshots,
+                    COALESCE(MAX(max_score), 0) AS highest_score,
+                    COALESCE(AVG(avg_score), 0) AS average_score
+                FROM proctor_sessions
+                WHERE user_id = %s;
+            """, (user_id,))
+            totals = dict(cur.fetchone())
+            cur.execute("""
+                SELECT session_id, status, start_time, end_time, uptime_sec,
+                       total_violations, suspicious_score, avg_score, max_score,
+                       flags, screenshot_count, gaze_focus, violation_counts
+                  FROM proctor_sessions
+                 WHERE user_id = %s
+                 ORDER BY updated_at DESC
+                 LIMIT 5;
+            """, (user_id,))
+            sessions = [dict(row) for row in cur.fetchall()]
+            cur.execute("""
+                SELECT session_id, path, reason, created_at
+                  FROM session_screenshots
+                 WHERE user_id = %s
+                 ORDER BY created_at DESC
+                 LIMIT 10;
+            """, (user_id,))
+            screenshots = [dict(row) for row in cur.fetchall()]
+            cur.execute("""
+                SELECT session_id, event_type, message, payload, created_at
+                  FROM session_logs
+                 WHERE user_id = %s
+                 ORDER BY created_at DESC
+                 LIMIT 20;
+            """, (user_id,))
+            logs = [dict(row) for row in cur.fetchall()]
+            return {"totals": totals, "recent_sessions": sessions, "screenshots": screenshots, "logs": logs}
+
+
+db = Database(DATABASE_URL)
+db.initialize()
+
+
+def serialize_db(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [serialize_db(item) for item in value]
+    if isinstance(value, dict):
+        return {key: serialize_db(item) for key, item in value.items()}
+    return value
+
+
+def create_token(user) -> str:
+    payload = {
+        "sub": str(user["id"]),
+        "username": user["username"],
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXP_HOURS),
+    }
+    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm=JWT_ALGORITHM)
+
+
+def authenticate_token(token: str):
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, app.config["SECRET_KEY"], algorithms=[JWT_ALGORITHM])
+        return db.get_user_by_id(int(payload["sub"]))
+    except Exception:
+        return None
+
+
+def current_user_from_request():
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.replace("Bearer ", "", 1).strip() if auth_header.startswith("Bearer ") else None
+    return authenticate_token(token)
+
+
+def require_auth(handler):
+    @wraps(handler)
+    def wrapper(*args, **kwargs):
+        user = current_user_from_request()
+        if not user:
+            return jsonify({"error": "Authentication required"}), 401
+        request.current_user = user
+        return handler(*args, **kwargs)
+    return wrapper
 
 # ─────────────────────────────────────────────────────────────────
 #  GLOBAL STATE MANAGEMENT
@@ -60,36 +354,60 @@ class ProctorServiceManager:
         self.proctor_system: ProctorSystem = None
         self.system_thread: threading.Thread = None
         self._running = False
-        self._state = {
+        self._state = self._blank_state()
+        self._state_lock = threading.Lock()
+        self._stats_history = queue.Queue(maxsize=100)
+        self._last_db_update = 0.0
+
+    def _blank_state(self):
+        return {
             "status": "idle",          # idle, running, stopped
+            "user_id": None,
+            "username": None,
+            "display_name": None,
             "session_id": None,
             "start_time": None,
             "uptime_sec": 0.0,
             "frame_count": 0,
             "violations": 0,
+            "flags": 0,
             "suspicious_score": 0.0,
             "avg_score": 0.0,
             "max_score": 0.0,
             "total_blinks": 0,
+            "screenshot_count": 0,
+            "last_screenshot_path": None,
+            "violation_counts": {},
             "face_detected": False,
             "gaze_away": False,
+            "gaze_focus": True,
             "head_turned": False,
             "mouth_open": False,
             "audio_rms": 0.0,
         }
-        self._state_lock = threading.Lock()
-        self._stats_history = queue.Queue(maxsize=100)
 
-    def start_session(self):
+    def start_session(self, user):
         """Start a new proctoring session in background thread."""
         if self._running:
             return {"error": "Session already running"}
+        if not db.available:
+            return {"error": "Postgres is not available. Check DATABASE_URL and database status."}
 
         self._running = True
         self.proctor_system = ProctorSystem()
-        self._state["status"] = "running"
-        self._state["session_id"] = self.proctor_system.session_id
-        self._state["start_time"] = datetime.now().isoformat()
+        self._attach_logger_callbacks(user)
+
+        start_time = datetime.now().isoformat()
+        with self._state_lock:
+            self._state = self._blank_state()
+            self._state["status"] = "running"
+            self._state["user_id"] = int(user["id"])
+            self._state["username"] = user["username"]
+            self._state["display_name"] = user["display_name"]
+            self._state["session_id"] = self.proctor_system.session_id
+            self._state["start_time"] = start_time
+        db.create_session(user, self.proctor_system.session_id, start_time)
+        db.record_log(user["id"], self.proctor_system.session_id, "session_started", "Session started")
         
         self.system_thread = threading.Thread(
             target=self._run_system_loop, daemon=True
@@ -99,8 +417,27 @@ class ProctorServiceManager:
         return {
             "status": "started",
             "session_id": self.proctor_system.session_id,
+            "user": {"id": int(user["id"]), "username": user["username"], "display_name": user["display_name"]},
             "timestamp": datetime.now().isoformat()
         }
+
+    def _attach_logger_callbacks(self, user):
+        def record_event(event):
+            payload = {
+                "severity": event.severity,
+                "details": event.details,
+                "screenshot_path": event.screenshot_path,
+            }
+            db.record_log(user["id"], self.proctor_system.session_id, event.violation_type, event.details, payload)
+
+        def record_screenshot(path, reason):
+            db.record_screenshot(user["id"], self.proctor_system.session_id, path, reason)
+            with self._state_lock:
+                self._state["screenshot_count"] += 1
+                self._state["last_screenshot_path"] = path
+
+        self.proctor_system.logger.event_callback = record_event
+        self.proctor_system.logger.screenshot_callback = record_screenshot
 
     def _run_system_loop(self):
         """Run the ProctorSystem and emit state updates via WebSocket."""
@@ -183,15 +520,26 @@ class ProctorServiceManager:
                         self._state["frame_count"] = self.proctor_system._frame_count
                         self._state["uptime_sec"] = elapsed
                         self._state["violations"] = self.proctor_system._total_violations
+                        self._state["flags"] = self.proctor_system._total_violations
                         self._state["suspicious_score"] = self.proctor_system.detector.suspicious_score
                         self._state["avg_score"] = round(self.proctor_system.detector.avg_score, 2)
                         self._state["max_score"] = round(self.proctor_system.detector.max_score, 2)
                         self._state["total_blinks"] = self.proctor_system.eye_tracker.blink_count
+                        self._state["violation_counts"] = dict(self.proctor_system._violation_counts)
                         self._state["face_detected"] = face_data.detected
                         self._state["gaze_away"] = gaze_data.looking_away
+                        self._state["gaze_focus"] = not gaze_data.looking_away
                         self._state["head_turned"] = head_data.is_turned
                         self._state["mouth_open"] = mouth_data.is_open
                         self._state["audio_rms"] = audio_data.rms
+                    snapshot = self._get_state()
+
+                    if snapshot.get("user_id") and now - self._last_db_update > 2.0:
+                        try:
+                            db.update_session(snapshot["user_id"], snapshot)
+                        except Exception as e:
+                            print(f"[Database] Session update failed: {e}")
+                        self._last_db_update = now
 
                     # Emit update every 100ms
                     if frame_count % 3 == 0:
@@ -205,19 +553,25 @@ class ProctorServiceManager:
         finally:
             self._shutdown_system()
 
-    def stop_session(self):
+    def stop_session(self, user):
         """Stop the current proctoring session."""
         if not self._running:
             return {"error": "No session running"}
+        if not self._session_belongs_to(user):
+            return {"error": "Session belongs to another user"}
 
         self._running = False
         if self.system_thread:
             self.system_thread.join(timeout=5.0)
 
+        snapshot = self._get_state()
+        db.record_log(user["id"], snapshot["session_id"], "session_stopped", "Session stopped")
+        db.update_session(user["id"], snapshot, status="stopped", end_time=datetime.now().isoformat())
+
         return {
             "status": "stopped",
-            "session_id": self._state["session_id"],
-            "total_violations": self._state["violations"],
+            "session_id": snapshot["session_id"],
+            "total_violations": snapshot["violations"],
             "timestamp": datetime.now().isoformat()
         }
 
@@ -225,27 +579,46 @@ class ProctorServiceManager:
         """Clean up system resources."""
         if self.proctor_system:
             self.proctor_system._shutdown()
-        self._state["status"] = "stopped"
+        with self._state_lock:
+            self._state["status"] = "stopped"
+            snapshot = self._state.copy()
+        if snapshot.get("user_id"):
+            db.update_session(snapshot["user_id"], snapshot, status="stopped", end_time=datetime.now().isoformat())
         print("[Service] Session stopped")
 
-    def perform_action(self, action: str):
+    def perform_action(self, user, action: str):
         """Perform a control action."""
         if not self._running or not self.proctor_system:
             return {"error": "No session running"}
+        if not self._session_belongs_to(user):
+            return {"error": "Session belongs to another user"}
 
         if action == "screenshot":
             if self.proctor_system._last_frame is not None:
                 path = self.proctor_system.logger.save_screenshot(
                     self.proctor_system._last_frame, "API_SCREENSHOT")
+                db.record_log(user["id"], self._state["session_id"], "manual_screenshot", "Manual screenshot captured", {"path": path})
                 return {"action": "screenshot", "path": path}
             return {"error": "No frame available"}
 
         elif action == "reset":
             self.proctor_system.detector.reset_counters()
             self.proctor_system._total_violations = 0
+            self.proctor_system._violation_counts = {}
+            with self._state_lock:
+                self._state["violations"] = 0
+                self._state["flags"] = 0
+                self._state["violation_counts"] = {}
+                snapshot = self._state.copy()
+            db.record_log(user["id"], snapshot["session_id"], "reset", "Violation counters reset")
+            db.update_session(user["id"], snapshot)
             return {"action": "reset", "status": "counters cleared"}
 
         return {"error": f"Unknown action: {action}"}
+
+    def _session_belongs_to(self, user) -> bool:
+        with self._state_lock:
+            return self._state.get("user_id") == int(user["id"])
 
     def _get_state(self) -> dict:
         """Get current state snapshot."""
@@ -262,22 +635,39 @@ class ProctorServiceManager:
                     state[key] = int(state[key])
             return state
 
-    def get_session_stats(self) -> dict:
+    def get_state_for_user(self, user) -> dict:
+        state = self._get_state()
+        if state.get("user_id") and state["user_id"] != int(user["id"]):
+            return {
+                "status": "busy",
+                "message": "Another user has an active proctoring session",
+                "active_user": state.get("display_name") or state.get("username"),
+            }
+        return state
+
+    def get_session_stats(self, user) -> dict:
         """Get full session statistics."""
         if not self.proctor_system:
             return {"error": "No session running"}
+        if not self._session_belongs_to(user):
+            return {"error": "Session belongs to another user"}
 
         with self._state_lock:
             return {
+                "user_id": self._state["user_id"],
+                "username": self._state["username"],
                 "session_id": self._state["session_id"],
                 "start_time": self._state["start_time"],
                 "uptime_sec": self._state["uptime_sec"],
                 "frame_count": self._state["frame_count"],
                 "total_violations": self._state["violations"],
+                "flags": self._state["flags"],
                 "suspicious_score": self._state["suspicious_score"],
                 "avg_score": self._state["avg_score"],
                 "max_score": self._state["max_score"],
                 "total_blinks": self._state["total_blinks"],
+                "screenshot_count": self._state["screenshot_count"],
+                "gaze_focus": self._state["gaze_focus"],
                 "violation_counts": self.proctor_system._violation_counts,
             }
 
@@ -290,34 +680,91 @@ service_manager = ProctorServiceManager()
 #  REST API ENDPOINTS
 # ─────────────────────────────────────────────────────────────────
 
+@app.route('/api/auth/login', methods=['POST'])
+def api_login():
+    """Authenticate one of the seeded users and return a JWT."""
+    if not db.available:
+        return jsonify({"error": "Postgres is not available"}), 503
+
+    data = request.get_json() or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    user = db.get_user_by_username(username)
+    if not user or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "Invalid username or password"}), 401
+
+    return jsonify({
+        "token": create_token(user),
+        "expires_in_hours": JWT_EXP_HOURS,
+        "user": {
+            "id": int(user["id"]),
+            "username": user["username"],
+            "display_name": user["display_name"],
+        },
+    })
+
+
+@app.route('/api/auth/me', methods=['GET'])
+@require_auth
+def api_me():
+    """Return the signed-in user."""
+    user = request.current_user
+    return jsonify({
+        "user": {
+            "id": int(user["id"]),
+            "username": user["username"],
+            "display_name": user["display_name"],
+        },
+    })
+
+
+@app.route('/api/user/summary', methods=['GET'])
+@require_auth
+def api_user_summary():
+    """Return persisted metrics, screenshots, and logs for the signed-in user."""
+    try:
+        summary = db.get_user_summary(request.current_user["id"])
+        return jsonify(serialize_db(summary))
+    except Exception as e:
+        return jsonify({"error": f"Could not load user summary: {e}"}), 500
+
+
 @app.route('/api/status', methods=['GET'])
+@require_auth
 def api_status():
     """Get current system status."""
-    return jsonify(service_manager._get_state())
+    return jsonify(service_manager.get_state_for_user(request.current_user))
 
 
 @app.route('/api/start', methods=['POST'])
+@require_auth
 def api_start():
     """Start a new proctoring session."""
-    result = service_manager.start_session()
+    result = service_manager.start_session(request.current_user)
     return jsonify(result), 200 if "error" not in result else 400
 
 
 @app.route('/api/stop', methods=['POST'])
+@require_auth
 def api_stop():
     """Stop the current proctoring session."""
-    result = service_manager.stop_session()
+    result = service_manager.stop_session(request.current_user)
     return jsonify(result), 200 if "error" not in result else 400
 
 
 @app.route('/api/stats', methods=['GET'])
+@require_auth
 def api_stats():
     """Get detailed session statistics."""
-    result = service_manager.get_session_stats()
+    result = service_manager.get_session_stats(request.current_user)
     return jsonify(result), 200 if "error" not in result else 400
 
 
 @app.route('/api/action', methods=['POST'])
+@require_auth
 def api_action():
     """Perform a control action (screenshot, reset)."""
     data = request.get_json()
@@ -326,11 +773,12 @@ def api_action():
     if not action:
         return jsonify({"error": "Missing 'action' field"}), 400
 
-    result = service_manager.perform_action(action)
+    result = service_manager.perform_action(request.current_user, action)
     return jsonify(result), 200 if "error" not in result else 400
 
 
 @app.route('/api/config', methods=['GET'])
+@require_auth
 def api_config():
     """Get current configuration."""
     return jsonify({"config": CONFIG})
@@ -347,10 +795,14 @@ def index():
 # ─────────────────────────────────────────────────────────────────
 
 @socketio.on('connect')
-def on_connect():
+def on_connect(auth=None):
     """Handle WebSocket connection."""
+    token = auth.get("token") if isinstance(auth, dict) else None
+    user = authenticate_token(token)
+    if not user:
+        return False
     print("[WebSocket] Client connected")
-    emit('connect_response', {'status': 'connected'})
+    emit('connect_response', {'status': 'connected', 'user_id': int(user["id"])})
 
 
 @socketio.on('disconnect')
@@ -360,9 +812,14 @@ def on_disconnect():
 
 
 @socketio.on('request_state')
-def on_request_state():
+def on_request_state(data=None):
     """Client requests current state."""
-    emit('state_update', service_manager._get_state())
+    token = data.get("token") if isinstance(data, dict) else None
+    user = authenticate_token(token)
+    if not user:
+        emit('auth_error', {'error': 'Authentication required'})
+        return
+    emit('state_update', service_manager.get_state_for_user(user))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -651,13 +1108,114 @@ DASHBOARD_HTML = """
             color: #666;
             font-size: 0.9em;
         }
+
+        .login-panel {
+            max-width: 420px;
+            margin: 10vh auto;
+            background: rgba(30, 30, 46, 0.9);
+            border: 1px solid rgba(0, 180, 255, 0.25);
+            border-radius: 8px;
+            padding: 28px;
+        }
+
+        .login-panel h1 {
+            font-size: 2em;
+            margin-bottom: 8px;
+        }
+
+        .login-panel p {
+            color: #aaa;
+            margin-bottom: 22px;
+        }
+
+        .form-field {
+            display: grid;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .form-field label {
+            color: #aaa;
+            font-size: 0.85em;
+            text-transform: uppercase;
+        }
+
+        .form-field input {
+            width: 100%;
+            border: 1px solid rgba(200, 200, 200, 0.2);
+            border-radius: 8px;
+            padding: 12px 14px;
+            background: rgba(255, 255, 255, 0.08);
+            color: #e0e0e0;
+            font-size: 16px;
+        }
+
+        .login-error {
+            min-height: 22px;
+            color: #ff6b6b;
+            margin-top: 12px;
+        }
+
+        .user-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin-top: 16px;
+            color: #aaa;
+            flex-wrap: wrap;
+        }
+
+        .summary-list {
+            display: grid;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .summary-row {
+            display: grid;
+            grid-template-columns: 160px 1fr;
+            gap: 12px;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(200, 200, 200, 0.08);
+        }
+
+        .summary-row:last-child {
+            border-bottom: none;
+        }
+
+        .summary-meta {
+            color: #aaa;
+            font-size: 0.9em;
+        }
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="login-panel" id="loginPanel">
+        <h1>AI Exam Proctor</h1>
+        <p>Sign in to view and store your proctoring session data.</p>
+        <form id="loginForm">
+            <div class="form-field">
+                <label for="username">Username</label>
+                <input id="username" autocomplete="username" value="user1">
+            </div>
+            <div class="form-field">
+                <label for="password">Password</label>
+                <input id="password" type="password" autocomplete="current-password" value="User1@123">
+            </div>
+            <button class="btn-primary" type="submit" style="width:100%;">SIGN IN</button>
+            <div class="login-error" id="loginError"></div>
+        </form>
+    </div>
+
+    <div class="container" id="dashboardContainer" style="display:none;">
         <header>
             <h1>🎓 AI Exam Proctor Service</h1>
             <p>Real-time Proctoring Dashboard</p>
+            <div class="user-bar">
+                <span id="userLabel"></span>
+                <button class="btn-secondary" onclick="logout()">SIGN OUT</button>
+            </div>
             <div class="controls">
                 <button class="btn-primary" onclick="startSession()">START SESSION</button>
                 <button class="btn-danger" onclick="stopSession()">STOP SESSION</button>
@@ -763,7 +1321,38 @@ DASHBOARD_HTML = """
                     <div class="detail-label">Total Blinks</div>
                     <div class="detail-value" id="detailBlinks">—</div>
                 </div>
+                <div class="detail-item">
+                    <div class="detail-label">Flags</div>
+                    <div class="detail-value" id="detailFlags">0</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Screenshots</div>
+                    <div class="detail-value" id="detailScreenshots">0</div>
+                </div>
             </div>
+        </div>
+
+        <div class="details-section">
+            <h2>Stored User Data</h2>
+            <div class="details-grid">
+                <div class="detail-item">
+                    <div class="detail-label">Saved Sessions</div>
+                    <div class="detail-value" id="savedSessions">0</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Saved Violations</div>
+                    <div class="detail-value" id="savedViolations">0</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Saved Flags</div>
+                    <div class="detail-value" id="savedFlags">0</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Saved Screenshots</div>
+                    <div class="detail-value" id="savedScreenshots">0</div>
+                </div>
+            </div>
+            <div class="summary-list" id="sessionLogList"></div>
         </div>
 
         <footer>
@@ -772,26 +1361,127 @@ DASHBOARD_HTML = """
     </div>
 
     <script>
-        const socket = io();
+        let socket = null;
+        let authToken = localStorage.getItem('proctorToken');
+        let currentUser = JSON.parse(localStorage.getItem('proctorUser') || 'null');
 
-        socket.on('connect', () => {
-            console.log('Connected to server');
-            socket.emit('request_state');
+        document.getElementById('loginForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            document.getElementById('loginError').textContent = '';
+            try {
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: document.getElementById('username').value,
+                        password: document.getElementById('password').value
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    document.getElementById('loginError').textContent = data.error || 'Sign in failed';
+                    return;
+                }
+                authToken = data.token;
+                currentUser = data.user;
+                localStorage.setItem('proctorToken', authToken);
+                localStorage.setItem('proctorUser', JSON.stringify(currentUser));
+                showDashboard();
+            } catch (error) {
+                document.getElementById('loginError').textContent = error.message;
+            }
         });
 
-        socket.on('state_update', (data) => {
-            updateDashboard(data);
-        });
+        async function apiFetch(url, options = {}) {
+            const headers = {
+                ...(options.headers || {}),
+                Authorization: 'Bearer ' + authToken
+            };
+            const response = await fetch(url, { ...options, headers });
+            if (response.status === 401) {
+                logout();
+                throw new Error('Sign in again');
+            }
+            return response;
+        }
+
+        async function showDashboard() {
+            document.getElementById('loginPanel').style.display = 'none';
+            document.getElementById('dashboardContainer').style.display = 'block';
+            document.getElementById('userLabel').textContent =
+                `Signed in as ${currentUser.display_name} (${currentUser.username})`;
+            connectSocket();
+            await refreshStatus();
+            await loadUserSummary();
+        }
+
+        function showLogin() {
+            document.getElementById('loginPanel').style.display = 'block';
+            document.getElementById('dashboardContainer').style.display = 'none';
+        }
+
+        function logout() {
+            localStorage.removeItem('proctorToken');
+            localStorage.removeItem('proctorUser');
+            authToken = null;
+            currentUser = null;
+            if (socket) socket.disconnect();
+            showLogin();
+        }
+
+        function connectSocket() {
+            if (socket) socket.disconnect();
+            socket = io({ auth: { token: authToken } });
+
+            socket.on('connect', () => {
+                console.log('Connected to server');
+                socket.emit('request_state', { token: authToken });
+            });
+
+            socket.on('state_update', (data) => {
+                updateDashboard(data);
+            });
+
+            socket.on('auth_error', () => logout());
+        }
+
+        async function loadUserSummary() {
+            try {
+                const response = await apiFetch('/api/user/summary');
+                const data = await response.json();
+                if (data.error) return;
+                const totals = data.totals || {};
+                document.getElementById('savedSessions').textContent = totals.session_count || 0;
+                document.getElementById('savedViolations').textContent = totals.total_violations || 0;
+                document.getElementById('savedFlags').textContent = totals.total_flags || 0;
+                document.getElementById('savedScreenshots').textContent = totals.total_screenshots || 0;
+
+                const logList = document.getElementById('sessionLogList');
+                logList.innerHTML = '';
+                (data.logs || []).slice(0, 6).forEach((item) => {
+                    const row = document.createElement('div');
+                    row.className = 'summary-row';
+                    row.innerHTML = `
+                        <div class="summary-meta">${new Date(item.created_at).toLocaleString()}</div>
+                        <div>${item.event_type}: ${item.message}</div>
+                    `;
+                    logList.appendChild(row);
+                });
+            } catch (error) {
+                console.error('Summary error:', error);
+            }
+        }
 
         async function startSession() {
             try {
-                const response = await fetch('/api/start', { method: 'POST' });
+                const response = await apiFetch('/api/start', { method: 'POST' });
                 const data = await response.json();
                 if (!data.error) {
                     console.log('Session started:', data);
-                    alert('✓ Session started: ' + data.session_id);
+                    alert('Session started: ' + data.session_id);
+                    loadUserSummary();
                 } else {
-                    alert('✗ Error: ' + data.error);
+                    alert('Error: ' + data.error);
                 }
             } catch (error) {
                 console.error('Error:', error);
@@ -801,13 +1491,14 @@ DASHBOARD_HTML = """
         async function stopSession() {
             if (!confirm('Are you sure you want to stop the session?')) return;
             try {
-                const response = await fetch('/api/stop', { method: 'POST' });
+                const response = await apiFetch('/api/stop', { method: 'POST' });
                 const data = await response.json();
                 if (!data.error) {
                     console.log('Session stopped:', data);
-                    alert('✓ Session stopped');
+                    alert('Session stopped');
+                    loadUserSummary();
                 } else {
-                    alert('✗ Error: ' + data.error);
+                    alert('Error: ' + data.error);
                 }
             } catch (error) {
                 console.error('Error:', error);
@@ -816,16 +1507,17 @@ DASHBOARD_HTML = """
 
         async function takeScreenshot() {
             try {
-                const response = await fetch('/api/action', {
+                const response = await apiFetch('/api/action', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ action: 'screenshot' })
                 });
                 const data = await response.json();
                 if (!data.error) {
-                    alert('✓ Screenshot saved: ' + data.path);
+                    alert('Screenshot saved: ' + data.path);
+                    loadUserSummary();
                 } else {
-                    alert('✗ Error: ' + data.error);
+                    alert('Error: ' + data.error);
                 }
             } catch (error) {
                 console.error('Error:', error);
@@ -835,19 +1527,30 @@ DASHBOARD_HTML = """
         async function resetCounters() {
             if (!confirm('Reset all violation counters?')) return;
             try {
-                const response = await fetch('/api/action', {
+                const response = await apiFetch('/api/action', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ action: 'reset' })
                 });
                 const data = await response.json();
                 if (!data.error) {
-                    alert('✓ Counters reset');
+                    alert('Counters reset');
+                    loadUserSummary();
                 } else {
-                    alert('✗ Error: ' + data.error);
+                    alert('Error: ' + data.error);
                 }
             } catch (error) {
                 console.error('Error:', error);
+            }
+        }
+
+        async function refreshStatus() {
+            try {
+                const response = await apiFetch('/api/status');
+                const data = await response.json();
+                updateDashboard(data);
+            } catch (error) {
+                console.error('Status error:', error);
             }
         }
 
@@ -857,10 +1560,18 @@ DASHBOARD_HTML = """
             const statusDot = document.getElementById('statusDot');
             const sessionIdDiv = document.getElementById('sessionId');
 
+            if (state.status === 'busy') {
+                statusElement.textContent = 'BUSY';
+                statusDot.className = 'status-dot warning';
+                sessionIdDiv.textContent = state.message || 'Another user has an active session';
+                sessionIdDiv.style.display = 'block';
+                return;
+            }
+
             if (state.status === 'running') {
                 statusElement.textContent = 'ACTIVE';
                 statusDot.className = 'status-dot active';
-                if (state.session_id && !sessionIdDiv.textContent) {
+                if (state.session_id) {
                     sessionIdDiv.textContent = 'Session: ' + state.session_id;
                     sessionIdDiv.style.display = 'block';
                     document.getElementById('detailSessionId').textContent = state.session_id;
@@ -868,6 +1579,9 @@ DASHBOARD_HTML = """
                 }
             } else if (state.status === 'idle') {
                 statusElement.textContent = 'IDLE';
+                statusDot.className = 'status-dot idle';
+            } else if (state.status === 'stopped') {
+                statusElement.textContent = 'STOPPED';
                 statusDot.className = 'status-dot idle';
             }
 
@@ -880,6 +1594,8 @@ DASHBOARD_HTML = """
 
             // Violations
             document.getElementById('violations').textContent = state.violations;
+            document.getElementById('detailFlags').textContent = state.flags || state.violations || 0;
+            document.getElementById('detailScreenshots').textContent = state.screenshot_count || 0;
             const violationBar = document.getElementById('violationBar');
             violationBar.style.width = Math.min(state.violations * 5, 100) + '%';
             const violationValue = document.querySelector('[id="violations"]');
@@ -895,6 +1611,11 @@ DASHBOARD_HTML = """
             document.getElementById('suspiciousScore').textContent = state.suspicious_score.toFixed(1);
             const scoreBar = document.getElementById('scoreBar');
             scoreBar.style.width = state.suspicious_score + '%';
+            document.getElementById('detailAvgScore').textContent =
+                state.avg_score !== undefined ? Number(state.avg_score).toFixed(1) : '—';
+            document.getElementById('detailMaxScore').textContent =
+                state.max_score !== undefined ? Number(state.max_score).toFixed(1) : '—';
+            document.getElementById('detailBlinks').textContent = state.total_blinks || 0;
             const scoreValue = document.querySelector('[id="suspiciousScore"]');
             if (state.suspicious_score > 60) {
                 scoreValue.className = 'card-value alert-high';
@@ -928,10 +1649,32 @@ DASHBOARD_HTML = """
 
         // Request state periodically
         setInterval(async () => {
-            if (socket.connected) {
-                socket.emit('request_state');
+            if (socket && socket.connected && authToken) {
+                socket.emit('request_state', { token: authToken });
             }
         }, 1000);
+
+        setInterval(async () => {
+            if (authToken) {
+                loadUserSummary();
+            }
+        }, 5000);
+
+        (async function initAuth() {
+            if (!authToken || !currentUser) {
+                showLogin();
+                return;
+            }
+            try {
+                const response = await apiFetch('/api/auth/me');
+                const data = await response.json();
+                currentUser = data.user;
+                localStorage.setItem('proctorUser', JSON.stringify(currentUser));
+                showDashboard();
+            } catch (error) {
+                logout();
+            }
+        })();
     </script>
 </body>
 </html>
@@ -950,6 +1693,8 @@ if __name__ == '__main__':
     print("  Dashboard: http://localhost:8765")
     print()
     print("  REST API Endpoints:")
+    print("    POST /api/auth/login   - Sign in and receive JWT")
+    print("    GET  /api/user/summary - Persisted user metrics")
     print("    GET  /api/status    — Current status")
     print("    POST /api/start     — Start session")
     print("    POST /api/stop      — Stop session")
